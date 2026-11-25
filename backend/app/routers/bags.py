@@ -1,5 +1,4 @@
 from __future__ import annotations
-from app.services import race_surface
 
 from fastapi import APIRouter, HTTPException
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
@@ -48,20 +47,26 @@ class BagAddIn(BaseModel):
 
 
 @router.get("/封袋")
+@router.get("/袋册")
 @router.get("/bags")
-def list_bags():
+def list_bags(shift_id: int | None = None, 班次编号: int | None = None):
+    target_shift = shift_id if shift_id is not None else 班次编号
     with db(write=False) as conn:
-        return rows_to_list(conn.execute(
-            """
+        sql = """
             SELECT b.*, c.code AS 口门码,
               (SELECT COUNT(*) FROM scans s WHERE s.bag_id=b.id) AS 件数
             FROM bags b JOIN chutes c ON c.id=b.chute_id
-            ORDER BY b.id DESC LIMIT 100
-            """
-        ).fetchall())
+        """
+        params: tuple = ()
+        if target_shift is not None:
+            sql += " WHERE b.shift_id=?"
+            params = (target_shift,)
+        sql += " ORDER BY b.id DESC LIMIT 100"
+        return rows_to_list(conn.execute(sql, params).fetchall())
 
 
 @router.get("/封袋/{bag_id}")
+@router.get("/袋册/{bag_id}")
 @router.get("/bags/{bag_id}")
 def get_bag(bag_id: int):
     with db(write=False) as conn:
@@ -91,6 +96,10 @@ def get_bag(bag_id: int):
             (bag_id,),
         ).fetchall())
         result["袋件"] = bag_items
+        result["袋册成员"] = bag_items
+        result["成员"] = bag_items
+        result["members"] = bag_items
+        result["scans"] = bag_items
         result["明细"] = bag_items
         result["items"] = bag_items
         result["回执"] = receipts
@@ -99,6 +108,7 @@ def get_bag(bag_id: int):
 
 
 @router.post("/封袋/开袋")
+@router.post("/集包/开袋")
 @router.post("/bags/open")
 def open_bag(body: BagOpenIn):
     return open_bag_service(
@@ -112,6 +122,7 @@ def open_bag(body: BagOpenIn):
 
 
 @router.post("/封袋/{bag_id}/入袋")
+@router.post("/集包/{bag_id}/入袋")
 @router.post("/bags/{bag_id}/add")
 @router.post("/bags/{bag_id}/items")
 def add_to_bag(bag_id: int, body: BagAddIn):
@@ -129,6 +140,7 @@ def add_to_bag(bag_id: int, body: BagAddIn):
 
 
 @router.post("/封袋/{bag_id}/封口")
+@router.post("/集包/{bag_id}/封口")
 @router.post("/bags/{bag_id}/seal")
 def seal_bag(bag_id: int):
     return seal_bag_service(
@@ -139,14 +151,4 @@ def seal_bag(bag_id: int):
         require_func=require_unsealed,
         shift_func=current_shift,
     )
-
-_add_to_bag_impl = add_to_bag
-
-
-def add_to_bag(*args, **kwargs):
-    out = _add_to_bag_impl(*args, **kwargs)
-    return race_surface.after_bag(out, *args, **kwargs)
-
-def _surface_router_bags() -> dict:
-    return {"panel": "bags", "ready": True}
 

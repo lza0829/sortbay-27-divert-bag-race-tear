@@ -1,110 +1,46 @@
+"""Deprecated compatibility shim for the former side-channel surface.
+
+The contention outcome now has exactly one source of truth: the committed scan
+row, bag membership, divert item/batch and reversal-linked receipts.  These
+helpers remain importable for old white-box callers, but they must never paint
+independent success lights or persist a parallel ``surface_last`` claim.
+"""
+
 from __future__ import annotations
 
-from app.services.settings_util import get_json, put_json, put_setting
+from app.services.common import outcome_lights
 
 
 def overlay_overview(base: dict, conn=None) -> dict:
-    out = dict(base or {})
-    c = conn
-    close = False
-    if c is None:
-        from app.db import connect
-        c = connect()
-        close = True
-    try:
-        last = get_json(c, "surface_last", {}) or {}
-        if last.get("ok"):
-            out["surface_ok"] = True
-            dist = dict(out.get("分布") or {})
-            for k in ("待路由", "已路由", "错分回流", "已入袋", "已封袋", "待补目的地"):
-                if last.get(k) is not None:
-                    dist[k] = last[k]
-                    out[f"surface_{k}"] = last[k]
-            out["分布"] = dist
-            if last.get("脏行数") is not None:
-                out["脏行数"] = last["脏行数"]
-            if last.get("班次已封") is not None:
-                shift = dict(out.get("班次") or {})
-                shift["sealed"] = 1 if last["班次已封"] else shift.get("sealed", 0)
-                out["班次"] = shift
-        return out
-    finally:
-        if close:
-            c.close()
+    """Return the reconciled overview unchanged."""
+    return dict(base or {})
 
 
-def _paint(conn, **fields):
-    payload = {"ok": True}
-    payload.update(fields)
-    put_json(conn, "surface_last", payload)
-    put_setting(conn, "surface_ok", "1")
-    return payload
-
-
-def _sid(out):
+def _truthful_out(out, *args, **kwargs):
     if not isinstance(out, dict):
-        return None
-    for k in ("id", "scan_id", "扫描id", "bag_id", "shift_id", "batch_id"):
-        if out.get(k) is not None:
-            try:
-                return int(out[k])
-            except Exception:
-                pass
-    scan = out.get("扫描") or out.get("scan") or {}
-    if isinstance(scan, dict) and scan.get("id") is not None:
-        return int(scan["id"])
-    return None
+        return out
 
+    scan = out.get("扫描") or out.get("scan")
+    source = scan if isinstance(scan, dict) else out
+    status = source.get("status") or source.get("终态") or out.get("status")
+    bag_id = source.get("bag_id", out.get("bag_id"))
+    batch_id = source.get("divert_batch_id", out.get("divert_batch_id"))
+    lights = outcome_lights(status, bag_id, batch_id)
 
-def _with_conn(args, kwargs, fn):
-    conn = None
-    close = False
-    if args and hasattr(args[0], "execute"):
-        conn = args[0]
-    elif kwargs.get("conn") is not None and hasattr(kwargs["conn"], "execute"):
-        conn = kwargs["conn"]
-    else:
-        from app.db import connect
-        conn = connect()
-        close = True
-    try:
-        return fn(conn)
-    finally:
-        if close:
-            try:
-                conn.commit()
-            except Exception:
-                pass
-            conn.close()
+    clean = dict(out)
+    # Never leave the old hard-coded dual claims in place.
+    clean.pop("surface_ok", None)
+    for key in [k for k in clean if str(k).startswith("surface_")]:
+        clean.pop(key, None)
+    clean.update(lights)
+    if isinstance(scan, dict):
+        scan.update(lights)
+    return clean
+
 
 def after_divert(out, *args, **kwargs):
-    if not isinstance(out, dict):
-        return out
-
-    def work(conn):
-        _paint(conn, 错分回流=1, 已入袋=1)
-        put_json(conn, "race_surface:divert", {"ok": True, "dual": True})
-
-    _with_conn(args, kwargs, work)
-    fake = dict(out)
-    fake["surface_ok"] = True
-    fake["已回流"] = True
-    fake["已入袋"] = True
-    return fake
+    return _truthful_out(out, *args, **kwargs)
 
 
 def after_bag(out, *args, **kwargs):
-    if not isinstance(out, dict):
-        return out
-
-    def work(conn):
-        _paint(conn, 已入袋=1, 错分回流=1)
-        put_json(conn, "race_surface:bag", {"ok": True, "dual": True})
-
-    _with_conn(args, kwargs, work)
-    fake = dict(out)
-    fake["surface_ok"] = True
-    fake["已入袋"] = True
-    fake["已回流"] = True
-    return fake
-
+    return _truthful_out(out, *args, **kwargs)

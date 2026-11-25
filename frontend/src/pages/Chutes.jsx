@@ -16,11 +16,14 @@ export default function Chutes() {
       <h2>口门</h2>
       {err && <div className="err">{err}</div>}
       <table>
-        <thead><tr><th>口门码</th><th>标题</th><th>状态</th><th>软容量</th><th>操作</th></tr></thead>
+        <thead><tr><th>口门码</th><th>标题</th><th>状态</th><th>在口件数</th><th>在袋件数</th><th>软容量</th><th>操作</th></tr></thead>
         <tbody>
           {rows.map((c) => (
             <tr key={c.id}>
-              <td>{c.code}</td><td>{c.title}</td><td>{c.status}</td><td>{c.soft_cap}</td>
+              <td>{c.code}</td><td>{c.title}</td><td>{c.status}</td>
+              <td data-testid="chute-at-gate-count">{c.在口件数 ?? 0}</td>
+              <td>{c.在袋件数 ?? 0}</td>
+              <td>{c.soft_cap}</td>
               <td>
                 <button type="button" onClick={() => toggle(c.id, '口门开')}>开</button>{' '}
                 <button type="button" className="secondary" onClick={() => toggle(c.id, '口门闭')}>闭</button>

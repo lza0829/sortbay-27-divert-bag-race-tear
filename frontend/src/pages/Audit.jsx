@@ -5,14 +5,23 @@ export default function Audit() {
   const [rows, setRows] = useState([])
   const [receipts, setReceipts] = useState([])
   const [replay, setReplay] = useState(null)
+  const [scanQuery, setScanQuery] = useState('')
+  const [barcodeQuery, setBarcodeQuery] = useState('')
   const [err, setErr] = useState('')
   const [msg, setMsg] = useState('')
 
-  const load = async () => {
+  const load = async (overrides = {}) => {
     setErr('')
     try {
+      const effectiveScanQuery = overrides.scanQuery ?? scanQuery
+      const effectiveBarcodeQuery = overrides.barcodeQuery ?? barcodeQuery
+      const params = new URLSearchParams({ limit: '200' })
+      const sid = String(effectiveScanQuery || '').trim()
+      const barcode = String(effectiveBarcodeQuery || '').trim()
+      if (sid) params.set('扫描编号', sid)
+      if (barcode) params.set('条码', barcode)
       const [auditRows, replayResult, receiptRows] = await Promise.all([
-        api('/审计?limit=200'),
+        api(`/审计/查询?${params.toString()}`),
         api('/审计/重放'),
         api('/回执'),
       ])
@@ -62,6 +71,36 @@ export default function Audit() {
           </tbody>
         </table>
       )}
+      <div className="row">
+        <label>扫描编号
+          <input
+            value={scanQuery}
+            onChange={(e) => setScanQuery(e.target.value)}
+            placeholder="例如 12"
+            data-testid="audit-scan-query"
+          />
+        </label>
+        <label>条码
+          <input
+            value={barcodeQuery}
+            onChange={(e) => setBarcodeQuery(e.target.value)}
+            placeholder="完整条码"
+            data-testid="audit-barcode-query"
+          />
+        </label>
+        <button type="button" onClick={load} data-testid="audit-query-submit">审计查询</button>
+        <button
+          type="button"
+          className="secondary"
+          onClick={() => {
+            setScanQuery('')
+            setBarcodeQuery('')
+            load({ scanQuery: '', barcodeQuery: '' })
+          }}
+        >
+          清空条件
+        </button>
+      </div>
       <div className="row">
         <button type="button" onClick={runReplay}>审计重放/总览对账</button>
         <button type="button" className="secondary" onClick={load}>刷新审计与回执</button>

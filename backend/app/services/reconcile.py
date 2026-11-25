@@ -26,6 +26,53 @@ def receipt_is_reversed(status: object) -> bool:
     return text in REVERSED_RECEIPT_STATUSES or text.lower() in REVERSED_RECEIPT_STATUSES
 
 
+def has_later_route_after_divert(conn, scan_id: int, batch_id: int) -> bool:
+    """Whether an old divert epoch was explicitly followed by re-routing."""
+    divert_route_event = conn.execute(
+        """
+        SELECT re.id
+        FROM route_events re
+        JOIN divert_batches b ON b.code=re.note
+        WHERE re.scan_id=?
+          AND re.action='错分回流'
+          AND b.id=?
+        ORDER BY re.id DESC
+        LIMIT 1
+        """,
+        (scan_id, batch_id),
+    ).fetchone()
+    if divert_route_event is not None:
+        return conn.execute(
+            """
+            SELECT 1 FROM route_events
+            WHERE scan_id=? AND action='路由落入' AND id>?
+            LIMIT 1
+            """,
+            (scan_id, divert_route_event["id"]),
+        ).fetchone() is not None
+
+    # White-box/legacy rows may have audit events without route_events.
+    divert_audit = conn.execute(
+        """
+        SELECT id FROM audit_events
+        WHERE kind='回流' AND action='建回流批次' AND ref_id=?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (batch_id,),
+    ).fetchone()
+    if divert_audit is None:
+        return False
+    return conn.execute(
+        """
+        SELECT 1 FROM audit_events
+        WHERE kind='扫描' AND action='路由裁决'
+          AND ref_id=? AND id>?
+        LIMIT 1
+        """,
+        (scan_id, divert_audit["id"]),
+    ).fetchone() is not None
+
+
 def add_issue(issues: list[dict], code: str, message: str, **extra) -> None:
     item = {
         "代码": code,
@@ -95,6 +142,14 @@ def reconcile_shift(conn, shift_id: int | None = None) -> dict:
                 add_issue(issues, "ROUTED_WITHOUT_CHUTE", "已路由件缺少口门", 扫描编号=sid)
             if scan["bag_id"] is not None:
                 add_issue(issues, "ROUTED_STILL_IN_BAG", "已路由件仍挂袋", 扫描编号=sid, 袋编号=scan["bag_id"])
+            if scan["divert_batch_id"] is not None:
+                add_issue(
+                    issues,
+                    "ROUTED_STILL_LINKED_DIVERT_BATCH",
+                    "已路由件仍挂当前回流批次；历史批次应只保留在回流明细中",
+                    扫描编号=sid,
+                    批次编号=scan["divert_batch_id"],
+                )
         elif status == "错分回流":
             if scan["bag_id"] is not None:
                 add_issue(
@@ -119,8 +174,34 @@ def reconcile_shift(conn, shift_id: int | None = None) -> dict:
                         扫描编号=sid,
                         批次编号=scan["divert_batch_id"],
                     )
+                divert_receipt = conn.execute(
+                    """
+                    SELECT * FROM operation_receipts
+                    WHERE (kind='回流' OR LOWER(kind) IN ('divert','return'))
+                      AND scan_id=? AND batch_id=?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (sid, scan["divert_batch_id"]),
+                ).fetchone()
+                if divert_receipt is None or not receipt_is_valid(divert_receipt["status"]):
+                    add_issue(
+                        issues,
+                        "DIVERT_RECEIPT_MISSING",
+                        "错分回流终态缺少有效回流回执",
+                        扫描编号=sid,
+                        批次编号=scan["divert_batch_id"],
+                    )
         elif status in ("已入袋", "已封袋"):
             bid = scan["bag_id"]
+            if scan["divert_batch_id"] is not None:
+                add_issue(
+                    issues,
+                    "BAGGED_WITH_DIVERT_BATCH",
+                    "在袋/封袋终态仍挂当前回流批次，形成袋册与回流批次双挂",
+                    扫描编号=sid,
+                    袋编号=bid,
+                    批次编号=scan["divert_batch_id"],
+                )
             if bid is None:
                 add_issue(issues, "BAGGED_WITHOUT_BAG", f"{status}件缺少袋编号", 扫描编号=sid)
             elif bid not in bag_ids:
@@ -197,14 +278,247 @@ def reconcile_shift(conn, shift_id: int | None = None) -> dict:
                     扫描编号=receipt["scan_id"],
                     袋编号=receipt["bag_id"],
                 )
-        elif receipt_is_reversed(receipt["status"]) and not receipt["reversed_by_receipt_id"]:
+        elif receipt_is_reversed(receipt["status"]):
+            reversed_by = receipt["reversed_by_receipt_id"]
+            if not reversed_by:
+                add_issue(
+                    issues,
+                    "REVERSAL_WITHOUT_LINK",
+                    "入袋回执已冲正但缺少回流回执链接",
+                    回执编号=receipt["id"],
+                    扫描编号=receipt["scan_id"],
+                )
+            else:
+                target = conn.execute(
+                    "SELECT * FROM operation_receipts WHERE id=?", (reversed_by,)
+                ).fetchone()
+                if target is None:
+                    add_issue(
+                        issues,
+                        "REVERSAL_LINK_DANGLING",
+                        "冲正链接指向不存在的回流回执",
+                        回执编号=receipt["id"],
+                        冲正指向=reversed_by,
+                        扫描编号=receipt["scan_id"],
+                    )
+                elif (
+                    target["scan_id"] != receipt["scan_id"]
+                    or str(target["kind"]).lower() not in {"回流", "divert", "return"}
+                    or not receipt_is_valid(target["status"])
+                ):
+                    add_issue(
+                        issues,
+                        "REVERSAL_LINK_INVALID",
+                        "冲正链接未指向同一件的有效回流回执",
+                        回执编号=receipt["id"],
+                        冲正指向=reversed_by,
+                        扫描编号=receipt["scan_id"],
+                    )
+
+    # Valid divert receipts must likewise land in a current diverted state,
+    # unless a later explicit re-route closed that historical epoch.
+    divert_receipts = rows_to_list(conn.execute(
+        """
+        SELECT r.*, s.status AS scan_status, s.divert_batch_id AS current_batch_id
+        FROM operation_receipts r
+        JOIN scans s ON s.id=r.scan_id
+        WHERE s.shift_id=?
+          AND (r.kind='回流' OR LOWER(r.kind) IN ('divert','return'))
+        ORDER BY r.id
+        """,
+        (shift_id,),
+    ).fetchall())
+    for receipt in divert_receipts:
+        if not receipt_is_valid(receipt["status"]):
+            continue
+        sid = receipt["scan_id"]
+        batch_id = receipt["batch_id"]
+        if batch_id is None:
             add_issue(
                 issues,
-                "REVERSAL_WITHOUT_LINK",
-                "入袋回执已冲正但缺少回流回执链接",
+                "DIVERT_RECEIPT_WITHOUT_BATCH",
+                "有效回流回执缺少回流批次编号",
                 回执编号=receipt["id"],
-                扫描编号=receipt["scan_id"],
+                扫描编号=sid,
             )
+            continue
+        if (
+            receipt["scan_status"] == "错分回流"
+            and receipt["current_batch_id"] == batch_id
+        ):
+            continue
+        if not has_later_route_after_divert(conn, sid, batch_id):
+            add_issue(
+                issues,
+                "DIVERT_RECEIPT_DANGLING",
+                "回流回执声称成功，却无当前回流终态/批次且无再路由证据",
+                回执编号=receipt["id"],
+                扫描编号=sid,
+                批次编号=batch_id,
+            )
+
+    duplicate_bag_receipts = rows_to_list(conn.execute(
+        """
+        SELECT r.scan_id AS scan_id, COUNT(*) AS c, GROUP_CONCAT(r.id) AS receipt_ids
+        FROM operation_receipts r
+        JOIN scans s ON s.id=r.scan_id
+        WHERE s.shift_id=?
+          AND (r.kind='入袋' OR LOWER(r.kind)='bag')
+          AND (
+            r.status IN ('有效', '成功', '已提交')
+            OR LOWER(r.status) IN ('valid', 'active', 'success', 'succeeded', 'committed', 'ok')
+          )
+        GROUP BY r.scan_id
+        HAVING COUNT(*) > 1
+        """,
+        (shift_id,),
+    ).fetchall())
+    for dup in duplicate_bag_receipts:
+        add_issue(
+            issues,
+            "MULTIPLE_VALID_BAG_RECEIPTS",
+            "同一件存在多张有效入袋回执，成功灯没有收敛到唯一袋册结局",
+            扫描编号=dup["scan_id"],
+            回执编号列表=dup["receipt_ids"],
+            数量=dup["c"],
+        )
+
+    # Bidirectional divert batch/item convergence.  A scan may be re-routed and
+    # diverted again, so an old divert_item is history rather than the current
+    # pointer; in that legal case a later route event must explain the change.
+    divert_rows = rows_to_list(conn.execute(
+        """
+        SELECT di.*,
+               db.shift_id AS batch_shift_id,
+               db.code AS batch_code,
+               s.shift_id AS scan_shift_id,
+               s.status AS scan_status,
+               s.divert_batch_id AS current_batch_id
+        FROM divert_items di
+        JOIN divert_batches db ON db.id=di.batch_id
+        JOIN scans s ON s.id=di.scan_id
+        WHERE db.shift_id=? OR s.shift_id=?
+        ORDER BY di.id
+        """,
+        (shift_id, shift_id),
+    ).fetchall())
+    for item in divert_rows:
+        item_id = item["id"]
+        sid = item["scan_id"]
+        batch_id = item["batch_id"]
+        if item["batch_shift_id"] != shift_id:
+            add_issue(
+                issues,
+                "DIVERT_ITEM_SHIFT_MISMATCH",
+                "回流明细挂到了其他班次的批次",
+                回流明细编号=item_id,
+                扫描编号=sid,
+                批次编号=batch_id,
+            )
+        if item["scan_shift_id"] != shift_id:
+            add_issue(
+                issues,
+                "DIVERT_ITEM_SCAN_SHIFT_MISMATCH",
+                "回流明细引用了其他班次的扫描",
+                回流明细编号=item_id,
+                扫描编号=sid,
+                批次编号=batch_id,
+            )
+
+        from_bag_id = item["from_bag_id"]
+        if from_bag_id is not None and from_bag_id not in bag_ids:
+            add_issue(
+                issues,
+                "DIVERT_ITEM_FROM_BAG_MISSING",
+                "回流带出记录指向不存在的来源袋",
+                回流明细编号=item_id,
+                扫描编号=sid,
+                袋编号=from_bag_id,
+            )
+
+        source_receipt_id = item["bag_receipt_id"]
+        if from_bag_id is not None and source_receipt_id is None:
+            add_issue(
+                issues,
+                "DIVERT_FROM_BAG_RECEIPT_MISSING",
+                "回流声称带出袋件，但明细缺少原入袋回执/冲正链",
+                回流明细编号=item_id,
+                扫描编号=sid,
+                袋编号=from_bag_id,
+                批次编号=batch_id,
+            )
+        elif source_receipt_id is not None:
+            source_receipt = conn.execute(
+                "SELECT * FROM operation_receipts WHERE id=?",
+                (source_receipt_id,),
+            ).fetchone()
+            if source_receipt is None:
+                add_issue(
+                    issues,
+                    "DIVERT_BAG_RECEIPT_LINK_DANGLING",
+                    "回流明细引用的原入袋回执不存在",
+                    回流明细编号=item_id,
+                    扫描编号=sid,
+                    回执编号=source_receipt_id,
+                )
+            elif not receipt_is_reversed(source_receipt["status"]):
+                add_issue(
+                    issues,
+                    "DIVERT_BAG_RECEIPT_NOT_REVERSED",
+                    "回流已带出袋件，但原入袋回执未冲正，形成两路成功宣称",
+                    回流明细编号=item_id,
+                    扫描编号=sid,
+                    回执编号=source_receipt_id,
+                    批次编号=batch_id,
+                )
+
+        if item["current_batch_id"] == batch_id:
+            if item["scan_status"] != "错分回流":
+                add_issue(
+                    issues,
+                    "DIVERT_CURRENT_ITEM_STATUS_MISMATCH",
+                    "当前回流批次明细与扫描终态不一致",
+                    回流明细编号=item_id,
+                    扫描编号=sid,
+                    批次编号=batch_id,
+                    当前状态=item["scan_status"],
+                )
+            continue
+
+        # The item is no longer the scan's current batch pointer.  Require
+        # evidence that the scan was explicitly routed again after this divert.
+        has_later_route = has_later_route_after_divert(conn, sid, batch_id)
+
+        if not has_later_route:
+            add_issue(
+                issues,
+                "DIVERT_ITEM_ORPHAN",
+                "回流批次明细仍在，但扫描当前终态/指针已离开该批次且无再路由证据",
+                回流明细编号=item_id,
+                扫描编号=sid,
+                批次编号=batch_id,
+                当前状态=item["scan_status"],
+            )
+
+    empty_batches = rows_to_list(conn.execute(
+        """
+        SELECT b.id, b.code
+        FROM divert_batches b
+        LEFT JOIN divert_items di ON di.batch_id=b.id
+        WHERE b.shift_id=?
+        GROUP BY b.id
+        HAVING COUNT(di.id)=0
+        """,
+        (shift_id,),
+    ).fetchall())
+    for batch in empty_batches:
+        add_issue(
+            issues,
+            "DIVERT_BATCH_EMPTY",
+            "回流批次册存在没有任何明细的批次",
+            批次编号=batch["id"],
+            批次码=batch["code"],
+        )
 
     bag_rows = rows_to_list(conn.execute(
         """
@@ -254,6 +568,22 @@ def reconcile_shift(conn, shift_id: int | None = None) -> dict:
         "SELECT COUNT(*) AS c FROM bags WHERE shift_id=? AND status='已封袋'",
         (shift_id,),
     ).fetchone()["c"]
+    dual_attached = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM scans
+        WHERE shift_id=?
+          AND bag_id IS NOT NULL
+          AND divert_batch_id IS NOT NULL
+        """,
+        (shift_id,),
+    ).fetchone()["c"]
+
+    terminal_lights = {
+        "回流": counts["错分回流"],
+        "集包": counts["已入袋"] + counts["已封袋"],
+        "双挂": int(dual_attached),
+    }
 
     return {
         "班次": row_to_dict(shift),
@@ -264,6 +594,20 @@ def reconcile_shift(conn, shift_id: int | None = None) -> dict:
         "已封袋数": int(sealed_bag),
         "回流批次数": int(batch_count),
         "回流件数": int(divert_item_count),
+        "回流明细数": int(divert_item_count),
+        "divert_item_count": int(divert_item_count),
+        "当前回流件数": counts["错分回流"],
+        "current_diverted_count": counts["错分回流"],
+        "双挂扫描数": int(dual_attached),
+        "dual_attached_scans": int(dual_attached),
+        "终态灯": terminal_lights,
+        "terminal_lights": terminal_lights,
+        "成功灯": terminal_lights,
+        "lights": {
+            "divert": terminal_lights["回流"],
+            "bag": terminal_lights["集包"],
+            "dual": terminal_lights["双挂"],
+        },
         "袋对账": bag_rows,
         "口门对账": chute_rows,
         "平衡": not issues,
@@ -274,6 +618,13 @@ def reconcile_shift(conn, shift_id: int | None = None) -> dict:
         "differences": issues,
         "issues": issues,
         "inconsistencies": issues,
+        "争用缺口": issues,
+        "contention_gaps": issues,
+        "gaps": issues,
+        "冻结宣称": bool(issues),
+        "claims_frozen": bool(issues),
+        "单一结局": not issues,
+        "single_outcome": not issues,
         "问题": [i["说明"] for i in issues],
     }
 
@@ -318,7 +669,12 @@ def replay_audit(conn, shift_id: int | None = None, scan_id: int | None = None) 
             scans.setdefault(sid, {
                 "status": None, "chute_id": None, "bag_id": None, "divert_batch_id": None
             })
-            scans[sid].update(status="已路由", chute_id=detail.get("chute_id"), bag_id=None)
+            scans[sid].update(
+                status="已路由",
+                chute_id=detail.get("chute_id"),
+                bag_id=None,
+                divert_batch_id=None,
+            )
         elif et == "bag_opened":
             bid = int(detail["bag_id"])
             bags[bid] = {"status": "集包中", "items": set(), "touched": set()}
@@ -383,7 +739,9 @@ def replay_audit(conn, shift_id: int | None = None, scan_id: int | None = None) 
             })
             continue
         for key in ("status", "chute_id", "bag_id", "divert_batch_id"):
-            if expected.get(key) is not None and current[key] != expected[key]:
+            # Compare None too: a resurrected bag_id/batch pointer is a replay
+            # mismatch even when the folded expected value is explicitly None.
+            if key in expected and current[key] != expected[key]:
                 differences.append({
                     "扫描编号": sid,
                     "字段": key,

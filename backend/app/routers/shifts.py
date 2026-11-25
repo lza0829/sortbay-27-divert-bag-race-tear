@@ -22,6 +22,7 @@ class ShiftIn(BaseModel):
 
 
 @router.get("/班次")
+@router.get("/班次列")
 def list_shifts():
     with db(write=False) as conn:
         return rows_to_list(conn.execute("SELECT * FROM shifts ORDER BY id DESC").fetchall())
@@ -29,7 +30,8 @@ def list_shifts():
 
 @router.get("/班次/对账")
 @router.get("/shifts/reconcile")
-def reconcile(shift_id: int | None = None):
+def reconcile(shift_id: int | None = None, 班次编号: int | None = None):
+    shift_id = shift_id if shift_id is not None else 班次编号
     with db(write=False) as conn:
         return reconcile_shift(conn, shift_id)
 

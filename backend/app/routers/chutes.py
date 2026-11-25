@@ -15,10 +15,45 @@ class ChuteIn(BaseModel):
 
 
 @router.get("/口门")
-def list_chutes():
-    with db() as conn:
+@router.get("/口门在口")
+def list_chutes(shift_id: int | None = None, 班次编号: int | None = None):
+    with db(write=False) as conn:
+        if shift_id is None:
+            shift_id = 班次编号
+        if shift_id is None:
+            shift = conn.execute(
+                "SELECT id FROM shifts ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            shift_id = shift["id"] if shift else None
         return rows_to_list(conn.execute(
-            "SELECT c.*, l.name AS 分拣线名 FROM chutes c JOIN lines l ON l.id=c.line_id ORDER BY c.code"
+            """
+            SELECT c.*, l.name AS 分拣线名,
+              (
+                SELECT COUNT(*) FROM scans s
+                WHERE s.chute_id=c.id
+                  AND (? IS NULL OR s.shift_id=?)
+                  AND s.status IN ('已路由','已入袋')
+              ) AS 在口件数,
+              (
+                SELECT COUNT(*) FROM scans s
+                WHERE s.chute_id=c.id
+                  AND (? IS NULL OR s.shift_id=?)
+                  AND s.status='已入袋'
+              ) AS 在袋件数,
+              (
+                SELECT COUNT(*) FROM scans s
+                WHERE s.chute_id=c.id
+                  AND (? IS NULL OR s.shift_id=?)
+                  AND s.status='错分回流'
+              ) AS 回流件数
+            FROM chutes c JOIN lines l ON l.id=c.line_id
+            ORDER BY c.code
+            """,
+            (
+                shift_id, shift_id,
+                shift_id, shift_id,
+                shift_id, shift_id,
+            ),
         ).fetchall())
 
 

@@ -137,3 +137,17 @@ th { background: #e4e8ee; }
 .muted { color: #66707c; font-size: 0.86rem; }
 code { white-space: pre-wrap; word-break: break-all; }
 ul.err { padding-left: 1.25rem; }
+
+.light {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #8b949e;
+  background: #eef1f4;
+  color: #66707c;
+  padding: 0.35rem 0.65rem;
+  border-radius: 999px;
+  font-size: 0.88rem;
+}
+.light.on.divert { background: #e7f0ff; border-color: #315f9f; color: #173f75; }
+.light.on.bag { background: #e8f6ec; border-color: #2f7d46; color: #1f5b31; }
+.light.dual { background: #fdecec; border-color: var(--danger); color: var(--danger); font-weight: 700; }

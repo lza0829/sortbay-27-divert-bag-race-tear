@@ -1,5 +1,4 @@
 from __future__ import annotations
-from app.services import race_surface
 
 from fastapi import APIRouter, HTTPException
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
@@ -40,24 +39,29 @@ class DivertIn(BaseModel):
 
 
 @router.get("/回流批次")
+@router.get("/回流批次册")
 @router.get("/diverts")
 @router.get("/divert-batches")
-def list_batches():
+def list_batches(shift_id: int | None = None, 班次编号: int | None = None):
+    target_shift = shift_id if shift_id is not None else 班次编号
     with db(write=False) as conn:
-        return rows_to_list(conn.execute(
-            """
+        sql = """
             SELECT b.*,
                    COUNT(di.id) AS 件数,
                    COALESCE(SUM(CASE WHEN di.from_bag_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS 带出袋件数
             FROM divert_batches b
             LEFT JOIN divert_items di ON di.batch_id=b.id
-            GROUP BY b.id
-            ORDER BY b.id DESC LIMIT 100
-            """
-        ).fetchall())
+        """
+        params: tuple = ()
+        if target_shift is not None:
+            sql += " WHERE b.shift_id=?"
+            params = (target_shift,)
+        sql += " GROUP BY b.id ORDER BY b.id DESC LIMIT 100"
+        return rows_to_list(conn.execute(sql, params).fetchall())
 
 
 @router.get("/回流批次/{batch_id}")
+@router.get("/回流批次册/{batch_id}")
 @router.get("/diverts/{batch_id}")
 @router.get("/divert-batches/{batch_id}")
 def get_batch(batch_id: int):
@@ -85,6 +89,7 @@ def get_batch(batch_id: int):
 
 
 @router.post("/回流批次")
+@router.post("/回流")
 @router.post("/diverts")
 @router.post("/divert-batches")
 def create_divert(body: DivertIn):
@@ -99,14 +104,4 @@ def create_divert(body: DivertIn):
         require_func=require_unsealed,
         shift_func=current_shift,
     )
-
-_create_divert_impl = create_divert
-
-
-def create_divert(*args, **kwargs):
-    out = _create_divert_impl(*args, **kwargs)
-    return race_surface.after_divert(out, *args, **kwargs)
-
-def _surface_router_diverts() -> dict:
-    return {"panel": "diverts", "ready": True}
 

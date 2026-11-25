@@ -1,5 +1,4 @@
 from __future__ import annotations
-from app.services import race_surface
 
 import inspect
 import sqlite3
@@ -14,6 +13,7 @@ from app.services.common import (
     current_shift,
     get_row_or_404,
     now_str,
+    outcome_lights,
     short_token,
 )
 from app.services.reconcile import reconcile_shift
@@ -156,7 +156,15 @@ def create_scan(
             raise HTTPException(400, "本班次条码已过机") from exc
 
         scan_id = cur.lastrowid
-        row = conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+        row = row_to_dict(conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone())
+        row.update({
+            "line_name": line["name"],
+            "分拣线名": line["name"],
+            "分拣线编号": line["id"],
+            **outcome_lights(
+                row.get("status"), row.get("bag_id"), row.get("divert_batch_id")
+            ),
+        })
         write_audit(
             conn,
             "扫描",
@@ -169,9 +177,17 @@ def create_scan(
                 "scan_id": scan_id,
                 "shift_id": shift["id"],
                 "barcode": barcode,
+                "dest_code": dest_code,
+                "destination_code": dest_code,
+                "line_id": line["id"],
+                "line_name": line["name"],
+                "分拣线编号": line["id"],
+                "分拣线": line["name"],
+                "目的地码": dest_code,
+                "条码": barcode,
             },
         )
-        return row_to_dict(row)
+        return row
 
 
 def route_scan(
@@ -207,11 +223,15 @@ def route_scan(
             raise HTTPException(400, "口门不存在")
         if chute["status"] != "口门开":
             raise HTTPException(400, "口门已闭，禁止落入")
+        line = conn.execute(
+            "SELECT * FROM lines WHERE id=?", (scan["line_id"],)
+        ).fetchone()
 
         cur = conn.execute(
             """
             UPDATE scans
-            SET status='已路由', chute_id=?, bag_id=NULL, version=version+1
+            SET status='已路由', chute_id=?, bag_id=NULL,
+                divert_batch_id=NULL, version=version+1
             WHERE id=? AND status IN ('待路由','错分回流')
             """,
             (chute["id"], scan_id),
@@ -237,11 +257,44 @@ def route_scan(
             detail={
                 "event_type": "scan_routed",
                 "scan_id": scan_id,
+                "barcode": scan["barcode"],
+                "dest_code": scan["dest_code"],
+                "destination_code": scan["dest_code"],
+                "line_id": scan["line_id"],
+                "line_name": line["name"] if line else None,
+                "rule_id": rule["id"],
                 "chute_id": chute["id"],
                 "chute_code": chute["code"],
+                "chute_status": chute["status"],
+                "decision": "路由落入",
+                "条码": scan["barcode"],
+                "目的地码": scan["dest_code"],
+                "分拣线编号": scan["line_id"],
+                "分拣线": line["name"] if line else None,
+                "口门编号": chute["id"],
+                "口门码": chute["code"],
             },
         )
-        return row_to_dict(conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone())
+        routed_row = row_to_dict(conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone())
+        routed_row.update({
+            "chute": row_to_dict(chute),
+            "口门": row_to_dict(chute),
+            "line": row_to_dict(line),
+            "分拣线对象": row_to_dict(line),
+            "chute_code": chute["code"],
+            "口门码": chute["code"],
+            "口门编号": chute["id"],
+            "目的地码": scan["dest_code"],
+            "分拣线编号": scan["line_id"],
+            "分拣线": line["name"] if line else None,
+            "路由裁决": f"{scan['dest_code']}->{chute['code']}",
+            **outcome_lights(
+                routed_row.get("status"),
+                routed_row.get("bag_id"),
+                routed_row.get("divert_batch_id"),
+            ),
+        })
+        return routed_row
 
 
 def open_bag(
@@ -367,10 +420,21 @@ def add_to_bag(
                 "scan_id": scan_id,
                 "bag_id": bag_id,
                 "receipt_id": receipt_id,
+                "barcode": scan["barcode"],
+                "条码": scan["barcode"],
+                "dest_code": scan["dest_code"],
+                "目的地码": scan["dest_code"],
+                "chute_id": scan["chute_id"],
+                "口门编号": scan["chute_id"],
             },
         )
 
         scan_row = row_to_dict(conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone())
+        scan_row.update(outcome_lights(
+            scan_row.get("status"),
+            scan_row.get("bag_id"),
+            scan_row.get("divert_batch_id"),
+        ))
         bag_row = row_to_dict(conn.execute("SELECT * FROM bags WHERE id=?", (bag_id,)).fetchone())
         count = conn.execute(
             "SELECT COUNT(*) AS c FROM scans WHERE bag_id=?", (bag_id,)
@@ -381,6 +445,8 @@ def add_to_bag(
         reconciliation = reconcile_shift(conn, shift["id"])
         result = dict(scan_row)
         result.update({
+            "结局": "已入袋",
+            "outcome": "bagged",
             "回执": receipt,
             "receipt": receipt,
             "袋": bag_row,
@@ -531,6 +597,12 @@ def create_divert(
                 "reversed_receipt_id": reversed_receipt_id,
                 "reversed_receipt_ids": reversed_receipt_ids,
                 "divert_receipt_id": divert_receipt_id,
+                "barcode": scan["barcode"],
+                "条码": scan["barcode"],
+                "dest_code": scan["dest_code"],
+                "目的地码": scan["dest_code"],
+                "chute_id": scan["chute_id"],
+                "口门编号": scan["chute_id"],
             },
         )
         if from_bag_id is not None:
@@ -551,12 +623,21 @@ def create_divert(
 
         batch = row_to_dict(conn.execute("SELECT * FROM divert_batches WHERE id=?", (batch_id,)).fetchone())
         scan_row = row_to_dict(conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone())
+        lights = outcome_lights(
+            scan_row.get("status"),
+            scan_row.get("bag_id"),
+            scan_row.get("divert_batch_id"),
+        )
+        scan_row.update(lights)
         receipt = row_to_dict(conn.execute("SELECT * FROM operation_receipts WHERE id=?", (divert_receipt_id,)).fetchone())
         item = row_to_dict(conn.execute(
             "SELECT * FROM divert_items WHERE batch_id=? AND scan_id=?", (batch_id, scan_id)
         ).fetchone())
         reconciliation = reconcile_shift(conn, shift["id"])
         return {
+            **lights,
+            "结局": "错分回流",
+            "outcome": "diverted",
             "批次": batch,
             "batch": batch,
             "扫描": scan_row,
@@ -630,18 +711,4 @@ def seal_bag(
             },
         )
         return row_to_dict(conn.execute("SELECT * FROM bags WHERE id=?", (bag_id,)).fetchone())
-
-_create_divert_impl = create_divert
-
-
-def create_divert(*args, **kwargs):
-    out = _create_divert_impl(*args, **kwargs)
-    return race_surface.after_divert(out, *args, **kwargs)
-
-_add_to_bag_impl = add_to_bag
-
-
-def add_to_bag(*args, **kwargs):
-    out = _add_to_bag_impl(*args, **kwargs)
-    return race_surface.after_bag(out, *args, **kwargs)
 

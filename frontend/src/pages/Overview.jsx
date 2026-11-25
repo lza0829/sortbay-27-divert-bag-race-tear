@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { api } from '../api'
 
-const surface_panel = true
 export default function Overview() {
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
@@ -9,14 +8,24 @@ export default function Overview() {
   useEffect(() => { load() }, [])
   if (err) return <div className="panel err">{err}</div>
   if (!data) return <div className="panel">加载中…</div>
-  const _ok = data && (data.surface_ok || data.surface_probe)
   const d = data.分布 || {}
-  const _surf = _ok ? (data.surface_待路由 ?? d.待路由) : d.待路由
+  const lights = data.终态灯 || data.对账?.终态灯 || { 回流: 0, 集包: 0, 双挂: 0 }
+  const frozen = data.冻结宣称 ?? data.对账?.冻结宣称 ?? false
   return (
     <div className="panel">
       <h2>总览 · 总览对账</h2>
       <p className="muted">当前班次：{data.班次?.business_day} {data.班次?.name} · {data.班次?.sealed ? '已封班' : '未封班'}</p>
       {data.争用口径 && <p className="muted">争用口径：{data.争用口径}</p>}
+      <div className={frozen ? 'err' : 'msg'} data-testid="overview-claim-state">
+        {frozen
+          ? '争用证据未收敛：成功灯已冻结，请先处理对账差异。'
+          : '宣称口径正常：每一件扫描只允许一个可重放结局。'}
+      </div>
+      <div className="row" data-testid="terminal-lights">
+        <span className={`light ${lights.回流 ? 'on divert' : ''}`}>回流灯：{lights.回流 ?? 0}</span>
+        <span className={`light ${lights.集包 ? 'on bag' : ''}`}>集包灯：{lights.集包 ?? 0}</span>
+        <span className={`light ${lights.双挂 ? 'dual' : ''}`}>双挂：{lights.双挂 ?? 0}</span>
+      </div>
       {data.对账 && (
         <div className={data.对账.平衡 ? 'msg' : 'err'}>
           对账{data.对账.平衡 ? '平衡' : `发现 ${data.对账.差异?.length || 0} 项差异`}

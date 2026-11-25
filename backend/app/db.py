@@ -223,6 +223,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
+    # Remove the abandoned side-channel claim store.  Overview/lights are
+    # derived from scans/bags/batches/receipts and must not be overridden.
+    conn.execute(
+        """
+        DELETE FROM settings
+        WHERE key IN ('surface_ok', 'surface_last')
+           OR key LIKE 'race_surface:%'
+        """
+    )
+
     # Backfill receipts/items for databases created before the closure ledger.
     conn.execute(
         """

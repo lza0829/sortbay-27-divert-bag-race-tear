@@ -17,8 +17,12 @@ from app.db import row_to_dict
 #   1. 回流先提交 -> 入袋 CAS 失败，整笔回滚，不增袋件数；
 #   2. 入袋先提交 -> 入袋落袋，回流随后显式把该件带出并记入回流批次。
 CONTENTION_POLICY = (
-    "提交顺序裁决：BEGIN IMMEDIATE 写锁与扫描 CAS 先提交者胜；"
-    "回流先提交则并发入袋整笔拒绝，入袋先提交则回流显式带出并冲正回执"
+    "架构一·单一终态可重放：扫描唯一状态、bag_id 袋册成员、"
+    "divert_items/回流批次与回执冲正链接是唯一裁决事实；"
+    "BEGIN IMMEDIATE 写锁与扫描 CAS 串行化两个写口。"
+    "回流先提交则并发入袋整笔拒绝并回滚；入袋先提交则回流随后在同一事务中"
+    "显式带出袋件、移除袋成员并冲正原入袋回执。最终只允许一个可重放结局，"
+    "不设旁路成功灯或独立争用宣称。"
 )
 
 
@@ -87,6 +91,60 @@ def conflict(message: str) -> HTTPException:
     # The existing API uses 400 for all illegal state transitions/business
     # rejections; keep that wire convention for race losers as well.
     return HTTPException(status_code=400, detail=message)
+
+
+def outcome_lights(
+    status: object,
+    bag_id: object | None = None,
+    divert_batch_id: object | None = None,
+) -> dict:
+    """Return the single, evidence-derived success-light claim for a scan.
+
+    A scan has one terminal/in-flight status at a time.  Bag membership also
+    requires ``bag_id``; diversion requires its batch.  These booleans are
+    presentation claims only: callers must derive them from the committed scan
+    row rather than from a side table or a post-response overlay.
+    """
+
+    status_text = str(status or "")
+    has_bag = bag_id is not None
+    has_batch = divert_batch_id is not None
+    dual_attached = has_bag and has_batch
+
+    # Contradictory pointers are corruption, not a legitimate "dual success".
+    # Freeze both presentation claims until reconciliation clears the twist.
+    in_bag = (
+        not dual_attached
+        and status_text in {"已入袋", "已封袋"}
+        and has_bag
+    )
+    diverted = (
+        not dual_attached
+        and status_text == "错分回流"
+        and has_batch
+    )
+    lights = {"回流": diverted, "集包": in_bag}
+    return {
+        "已回流": diverted,
+        "已入袋": in_bag,
+        "回流成功": diverted,
+        "集包成功": in_bag,
+        "diverted": diverted,
+        "bagged": in_bag,
+        "in_bag": in_bag,
+        "dual_success": False,
+        "双成功": False,
+        "dual_attached": dual_attached,
+        "双挂": dual_attached,
+        "claims_frozen": dual_attached,
+        "冻结宣称": dual_attached,
+        "evidence_consistent": not dual_attached,
+        "证据一致": not dual_attached,
+        "成功灯": dict(lights),
+        "lights": {"divert": diverted, "bag": in_bag},
+        "终态": status_text,
+        "status": status_text,
+    }
 
 
 def interrupt_flag_enabled() -> bool:
